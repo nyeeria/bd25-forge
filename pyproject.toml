@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "bd25-forge"
+version = "1.0.0"
+description = "GUI for transcoding a movie-only Blu-ray ISO to a 25 GB Blu-ray ISO"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+authors = [{name = "BD25 Forge contributors"}]
+
+[project.optional-dependencies]
+build = ["pyinstaller>=6.10,<7"]
+
+[project.gui-scripts]
+bd25-forge = "bd25.gui:main"
+
+[tool.setuptools.packages.find]
+include = ["bd25*"]

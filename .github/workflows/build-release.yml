@@ -1,0 +1,35 @@
+name: Build self-contained releases
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            artifact: windows-x86_64
+          - os: macos-14
+            artifact: macos-arm64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install build dependencies
+        run: python -m pip install -r packaging/requirements-build.txt
+      - name: Run tests
+        run: python -m unittest discover -v
+      - name: Build release
+        run: python packaging/build_release.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bd25-forge-${{ matrix.artifact }}
+          path: release/*
+          if-no-files-found: error
