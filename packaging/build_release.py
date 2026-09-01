@@ -15,7 +15,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.0.1"
 HANDBRAKE_VERSION = "1.11.2"
 TSMUXER_VERSION = "2.7.0"
 ROOT = Path(__file__).resolve().parents[1]

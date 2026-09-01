@@ -44,6 +44,19 @@ class ScanParsingTests(unittest.TestCase):
 
         self.assertEqual(result.main_feature, 4)
 
+    def test_rejects_implausibly_short_reported_main_feature(self) -> None:
+        payload = {
+            "MainFeature": 1,
+            "TitleList": [
+                {"Index": 1, "Duration": {"Minutes": 2}},
+                {"Index": 2, "Duration": {"Hours": 2}},
+            ],
+        }
+        result = parse_handbrake_scan("JSON Title Set: " + json.dumps(payload))
+
+        self.assertEqual(result.main_feature, 1)
+        self.assertEqual(result.selected_title.index, 2)
+
 
 class BitrateTests(unittest.TestCase):
     def test_two_hour_movie_uses_safe_target_rate(self) -> None:

@@ -41,10 +41,13 @@ class ScanResult:
 
     @property
     def selected_title(self) -> TitleInfo:
+        longest = max(self.titles, key=lambda item: item.duration_seconds)
         for title in self.titles:
             if title.index == self.main_feature:
-                return title
-        return max(self.titles, key=lambda item: item.duration_seconds)
+                if title.duration_seconds >= longest.duration_seconds * 0.8:
+                    return title
+                break
+        return longest
 
 
 @dataclass(frozen=True)
@@ -321,6 +324,15 @@ class Converter:
             echo=False,
         )
         result = parse_handbrake_scan(output)
+        titles = ", ".join(
+            f"{title.index}={_format_duration(title.duration_seconds)}" for title in result.titles
+        )
+        self._log(f"Detected titles: {titles}")
+        if result.selected_title.index != result.main_feature:
+            self._log(
+                f"HandBrake marked title {result.main_feature} as the main feature, but it was "
+                f"much shorter than title {result.selected_title.index}; using the longer title."
+            )
         self._progress("Scanning", 0.05, f"Selected title {result.selected_title.index}")
         return result
 
@@ -347,6 +359,17 @@ class Converter:
             self._check_cancelled()
             if not intermediate.is_file() or intermediate.stat().st_size == 0:
                 raise ConversionError("HandBrake finished without creating the encoded movie.")
+            expected_bytes = (
+                (bitrate + DEFAULT_AUDIO_BITRATE_KBPS)
+                * title.duration_seconds
+                * 1000
+                / 8
+            )
+            if intermediate.stat().st_size < expected_bytes * 0.5:
+                raise ConversionError(
+                    "The encoded movie is implausibly small for the selected title. "
+                    "Intermediate files were retained; check the activity log and choose the title manually."
+                )
 
             track_output = self._run_capture([str(options.tsmuxer), str(intermediate)], echo=True)
             video_track, audio_track = parse_tsmuxer_tracks(track_output)
@@ -364,6 +387,11 @@ class Converter:
             self._check_cancelled()
             if not options.destination.is_file() or options.destination.stat().st_size == 0:
                 raise ConversionError("tsMuxeR finished without creating an ISO.")
+            if options.destination.stat().st_size < intermediate.stat().st_size * 0.95:
+                raise ConversionError(
+                    "The authored ISO is much smaller than the encoded movie. "
+                    "The incomplete ISO was removed."
+                )
             if options.destination.stat().st_size > options.target_gb * DECIMAL_GB:
                 raise ConversionError(
                     "The authored ISO exceeded the requested size. The partial ISO was removed."
