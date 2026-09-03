@@ -13,7 +13,7 @@ python -m pip install -r packaging/requirements-build.txt
 python packaging/build_release.py
 ```
 
-The result is `release/BD25-Forge-1.0.1-windows-x86_64.zip`. Users extract it and run `BD25 Forge.exe`; no separate runtime installation is needed.
+The result is `release/BD25-Forge-1.0.5-windows-x86_64.zip`. Users extract it and run `BD25 Forge.exe`; no separate runtime installation is needed.
 
 ## macOS Apple Silicon
 

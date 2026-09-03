@@ -51,8 +51,10 @@ class BD25App(tk.Tk):
         self.destination_var = tk.StringVar()
         self.encoder_var = tk.StringVar()
         self.target_var = tk.StringVar(value="25.0")
-        self.language_var = tk.StringVar(value="eng")
         self.title_var = tk.StringVar(value="Auto")
+        self.audio_track_var = tk.StringVar(value="Select an audio track")
+        self._audio_track_map: dict[str, tuple[int, str]] = {}
+        self._scan_thread: threading.Thread | None = None
         self.forced_subs_var = tk.BooleanVar(value=False)
         self.status_var = tk.StringVar(value="Ready")
         self.detail_var = tk.StringVar(value="Choose a source ISO to begin")
@@ -104,7 +106,7 @@ class BD25App(tk.Tk):
         ttk.Label(heading, text="BD25 FORGE", style="Title.TLabel").pack(anchor="w")
         ttk.Label(
             heading,
-            text="Compress a movie-only Blu-ray ISO to fit a 25 GB disc",
+            text="Compress a Blu-ray ISO with every audio track to fit a 25 GB disc",
             style="Subtitle.TLabel",
         ).pack(anchor="w", pady=(2, 0))
 
@@ -117,31 +119,36 @@ class BD25App(tk.Tk):
 
         settings = ttk.Frame(root, style="Panel.TFrame", padding=18)
         settings.grid(row=2, column=0, sticky="ew", pady=(0, 12))
-        for column in range(4):
+        for column in range(3):
             settings.columnconfigure(column, weight=1 if column in (0, 1) else 0)
-        ttk.Label(settings, text="ENCODE SETTINGS", style="Section.TLabel").grid(row=0, column=0, columnspan=4, sticky="w", pady=(0, 12))
+        ttk.Label(settings, text="ENCODE SETTINGS", style="Section.TLabel").grid(row=0, column=0, columnspan=3, sticky="w", pady=(0, 12))
 
         ttk.Label(settings, text="Encoder", style="Panel.TLabel").grid(row=1, column=0, sticky="w")
         ttk.Label(settings, text="Target (decimal GB)", style="Panel.TLabel").grid(row=1, column=1, sticky="w", padx=(12, 0))
-        ttk.Label(settings, text="Audio language", style="Panel.TLabel").grid(row=1, column=2, sticky="w", padx=(12, 0))
-        ttk.Label(settings, text="Title", style="Panel.TLabel").grid(row=1, column=3, sticky="w", padx=(12, 0))
+        ttk.Label(settings, text="Title", style="Panel.TLabel").grid(row=1, column=2, sticky="w", padx=(12, 0))
 
         self.encoder_combo = ttk.Combobox(settings, textvariable=self.encoder_var, state="readonly", width=24)
         self.encoder_combo.grid(row=2, column=0, sticky="ew", pady=(5, 12))
         ttk.Entry(settings, textvariable=self.target_var, width=12).grid(row=2, column=1, sticky="ew", padx=(12, 0), pady=(5, 12))
-        ttk.Entry(settings, textvariable=self.language_var, width=12).grid(row=2, column=2, sticky="ew", padx=(12, 0), pady=(5, 12))
-        ttk.Entry(settings, textvariable=self.title_var, width=8).grid(row=2, column=3, sticky="ew", padx=(12, 0), pady=(5, 12))
+        ttk.Entry(settings, textvariable=self.title_var, width=8).grid(row=2, column=2, sticky="ew", padx=(12, 0), pady=(5, 12))
+        ttk.Label(settings, text="Audio track to copy", style="Panel.TLabel").grid(
+            row=3, column=0, sticky="w", pady=(0, 5)
+        )
+        self.audio_combo = ttk.Combobox(
+            settings, textvariable=self.audio_track_var, state="disabled"
+        )
+        self.audio_combo.grid(row=4, column=0, columnspan=2, sticky="ew", pady=(0, 12))
         ttk.Checkbutton(
             settings,
             text="Detect and burn forced subtitles",
             variable=self.forced_subs_var,
-        ).grid(row=3, column=0, columnspan=2, sticky="w")
+        ).grid(row=4, column=2, sticky="w", padx=(12, 0))
 
         ttk.Label(
             settings,
             text="Integrated transcoder and Blu-ray authoring runtime",
             style="PanelMuted.TLabel",
-        ).grid(row=4, column=0, columnspan=4, sticky="w", pady=(14, 0))
+        ).grid(row=5, column=0, columnspan=3, sticky="w", pady=(2, 0))
 
         activity = ttk.Frame(root, style="Panel.TFrame", padding=18)
         activity.grid(row=3, column=0, sticky="nsew")
@@ -198,6 +205,34 @@ class BD25App(tk.Tk):
             if not self.destination_var.get():
                 source = Path(filename)
                 self.destination_var.set(str(source.with_name(f"{source.stem}-BD25.iso")))
+            self._scan_source(Path(filename))
+
+    def _scan_source(self, source: Path) -> None:
+        self.audio_track_var.set("Scanning source...")
+        self.audio_combo.configure(state="disabled", values=())
+        self.status_var.set("SCANNING")
+        self.detail_var.set("Inspecting available audio tracks")
+        self._scan_thread = threading.Thread(
+            target=self._run_source_scan, args=(source,), daemon=True
+        )
+        self._scan_thread.start()
+
+    def _run_source_scan(self, source: Path) -> None:
+        if not self._handbrake:
+            return
+        try:
+            result = Converter().scan(self._handbrake, source)
+            title = result.selected_title
+            tracks = title.audio_track_indices or tuple(
+                range(1, max(1, title.audio_track_count) + 1)
+            )
+            descriptions = title.audio_track_descriptions or tuple(
+                f"Track {track}: Unknown" for track in tracks
+            )
+            languages = title.audio_track_languages or tuple("" for _ in tracks)
+            self._events.put(("audio_scan", tuple(zip(tracks, descriptions, languages))))
+        except Exception as exc:
+            self._events.put(("audio_scan_error", str(exc)))
 
     def _browse_destination(self) -> None:
         filename = filedialog.asksaveasfilename(title="Save BD25 ISO", defaultextension=".iso", filetypes=(("ISO images", "*.iso"),))
@@ -226,6 +261,7 @@ class BD25App(tk.Tk):
             title_text = self.title_var.get().strip()
             title = None if title_text.lower() in ("", "auto") else int(title_text)
             encoder = self._encoder_map[self.encoder_var.get()]
+            audio_track, audio_language = self._audio_track_map[self.audio_track_var.get()]
             destination = Path(self.destination_var.get()).expanduser().resolve()
             options = ConversionOptions(
                 source=Path(self.source_var.get()).expanduser().resolve(),
@@ -234,8 +270,9 @@ class BD25App(tk.Tk):
                 tsmuxer=self._tsmuxer,
                 encoder=encoder,
                 target_gb=target,
-                language=self.language_var.get().strip().lower(),
                 title=title,
+                audio_track=audio_track,
+                audio_language=audio_language or None,
                 burn_forced_subtitles=self.forced_subs_var.get(),
             )
         except (ValueError, KeyError):
@@ -294,6 +331,23 @@ class BD25App(tk.Tk):
                     self.status_var.set(str(stage).upper())
                     self.detail_var.set(str(message))
                     self.progress_var.set(float(fraction) * 100)
+                elif kind == "audio_scan":
+                    tracks = cast(tuple[tuple[int, str, str], ...], payload)
+                    self._audio_track_map = {
+                        description: (track, language)
+                        for track, description, language in tracks
+                    }
+                    values = tuple(self._audio_track_map)
+                    self.audio_combo.configure(state="readonly", values=values)
+                    self.audio_track_var.set(values[0] if values else "No audio tracks")
+                    self.status_var.set("READY")
+                    self.detail_var.set(f"Found {len(values)} audio track(s)")
+                elif kind == "audio_scan_error":
+                    self._audio_track_map = {}
+                    self.audio_combo.configure(state="disabled", values=())
+                    self.audio_track_var.set("Scan failed")
+                    self.status_var.set("SCAN FAILED")
+                    self.detail_var.set(str(payload))
                 elif kind == "log":
                     self._append_log(str(payload))
                 elif kind == "complete":

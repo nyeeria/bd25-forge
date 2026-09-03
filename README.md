@@ -1,6 +1,6 @@
 # BD25 Forge
 
-BD25 Forge is a self-contained desktop application that compresses the main feature from a 30 GB or 50 GB Blu-ray ISO and authors a movie-only Blu-ray ISO no larger than 25,000,000,000 bytes.
+BD25 Forge is a self-contained desktop application that compresses the main feature from a 30 GB or 50 GB Blu-ray ISO and authors a Blu-ray ISO no larger than 25,000,000,000 bytes.
 
 It supports:
 
@@ -27,7 +27,7 @@ An NVIDIA display driver is still required to use an NVIDIA GPU. Apple VideoTool
 
 ## Important Limitations
 
-- The output contains one movie title. Original menus, extras, Java content, and seamless menu behavior are not preserved.
+- The output contains the selected movie title and all of its audio tracks. Original menus, extras, and Java content are not preserved; tsMuxeR creates the standard Blu-ray title structure rather than interactive BD-J menus.
 - Use only unencrypted ISOs that you are legally allowed to process. The application does not remove Blu-ray encryption or copy protection.
 - GPU encoding is much faster, but CPU x264 generally gives better image quality at the same file size.
 - Hardware average-bitrate encoding is not byte-exact. The app reserves space for encoder variance, audio, M2TS overhead, and Blu-ray metadata, then verifies the completed ISO size.
@@ -41,7 +41,7 @@ An NVIDIA display driver is still required to use an NVIDIA GPU. Apple VideoTool
 4. Keep **Title** set to `Auto`, or enter a title number if the wrong playlist is selected.
 5. Select **Build BD25 ISO**.
 
-The first audio track is converted to Blu-ray-compatible 640 kb/s AC-3 5.1. The language field is the three-letter ISO 639-2 tag written into the disc, such as `eng`, `deu`, `fra`, or `jpn`.
+The source scan lists each available audio track with its original language, codec, channel layout, and bitrate. Choose one track in the GUI; that track is copied without transcoding or metadata overrides. Its original metadata is retained where supported, and its selected language code is written to the output track without defaulting to English.
 
 ## Build Distributable Apps
 

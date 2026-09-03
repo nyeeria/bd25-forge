@@ -13,7 +13,9 @@ from bd25.core import (
     build_handbrake_command,
     build_tsmuxer_meta,
     calculate_video_bitrate_kbps,
+    parse_handbrake_audio_codecs,
     parse_handbrake_scan,
+    parse_tsmuxer_track_set,
     parse_tsmuxer_tracks,
 )
 
@@ -24,13 +26,27 @@ class ScanParsingTests(unittest.TestCase):
             "MainFeature": 2,
             "TitleList": [
                 {"Index": 1, "Duration": {"Hours": 0, "Minutes": 12, "Seconds": 5}},
-                {"Index": 2, "Name": "Feature", "Duration": {"Hours": 2, "Minutes": 3, "Seconds": 4}},
+                {
+                    "Index": 2,
+                    "Name": "Feature",
+                    "Duration": {"Hours": 2, "Minutes": 3, "Seconds": 4},
+                    "AudioList": [
+                        {"Track": 2, "LanguageCode": "deu", "CodecName": "aac", "ChannelLayout": "5.1"},
+                        {"Track": 5, "Language": "Japanese", "CodecName": "ac3", "ChannelCount": 6},
+                    ],
+                },
             ],
         }
-        result = parse_handbrake_scan("log line\nJSON Title Set:\n" + json.dumps(payload) + "\nmore log")
+        result = parse_handbrake_scan(
+            "log line\nJSON Title Set:\n" + json.dumps(payload) + "\nmore log"
+        )
 
         self.assertEqual(result.main_feature, 2)
         self.assertEqual(result.selected_title.duration_seconds, 7384)
+        self.assertEqual(result.selected_title.audio_track_count, 2)
+        self.assertEqual(result.selected_title.audio_track_indices, (2, 5))
+        self.assertIn("deu", result.selected_title.audio_track_descriptions[0])
+        self.assertIn("Japanese", result.selected_title.audio_track_descriptions[1])
 
     def test_falls_back_to_longest_title(self) -> None:
         payload = {
@@ -94,8 +110,32 @@ class CommandTests(unittest.TestCase):
             )
 
         self.assertIn("nvenc_h264", command)
-        self.assertEqual(command[command.index("--enable-hw-decoding") + 1], "nvdec")
+        self.assertEqual(
+            command[command.index("--enable-hw-decoding") + 1],
+            "nvdec",
+        )
         self.assertEqual(command[command.index("-t") + 1], "7")
+        self.assertEqual(command[command.index("-E") + 1], "copy")
+        self.assertNotIn("--native-language", command)
+        self.assertNotIn("-B", command)
+
+    def test_command_includes_all_audio_tracks(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            base = Path(folder)
+            options = ConversionOptions(
+                source=base / "source.iso",
+                destination=base / "output.iso",
+                handbrake=base / "HandBrakeCLI",
+                tsmuxer=base / "tsMuxeR",
+                encoder=ENCODERS[-1],
+            )
+            command = build_handbrake_command(
+                options,
+                base / "encoded.mkv",
+                TitleInfo(index=1, duration_seconds=7200, audio_track_count=3),
+            )
+
+        self.assertEqual(command[command.index("-a") + 1], "1,2,3")
 
     def test_cpu_command_uses_multi_pass(self) -> None:
         with tempfile.TemporaryDirectory() as folder:
@@ -144,12 +184,94 @@ Stream ID: A_AC3
 """
         self.assertEqual(parse_tsmuxer_tracks(output), (4, 9))
 
+    def test_detects_all_audio_track_ids(self) -> None:
+        output = """Track ID: 4
+Stream ID: V_MPEG4/ISO/AVC
+Track ID: 9
+Stream ID: A_AC3
+Track ID: 10
+Stream ID: A_AC3
+"""
+        self.assertEqual(parse_tsmuxer_track_set(output), (4, ((9, "A_AC3"), (10, "A_AC3"))))
+
     def test_builds_bluray_iso_metadata(self) -> None:
-        meta = build_tsmuxer_meta(Path("movie.mkv"), 4, 9, "deu")
+        meta = build_tsmuxer_meta(Path("movie.mkv"), 4, 9)
 
         self.assertIn("MUXOPT --blu-ray", meta)
         self.assertIn("track=4", meta)
+        self.assertIn("A_AC3,", meta)
+        self.assertNotIn("lang=", meta)
+        self.assertNotIn("default", meta)
+
+    def test_writes_selected_language_without_defaulting_to_english(self) -> None:
+        meta = build_tsmuxer_meta(Path("movie.mkv"), 4, 9, "deu")
+
         self.assertIn("track=9, lang=deu", meta)
+        self.assertNotIn("lang=eng", meta)
+
+    def test_writes_all_audio_tracks_to_metadata(self) -> None:
+        meta = build_tsmuxer_meta(Path("movie.mkv"), 4, ((9, "A_AC3"), (10, "A_DTS")))
+
+        self.assertEqual(sum(meta.count(codec) for codec in ("A_AC3", "A_DTS")), 2)
+        self.assertIn("A_AC3,", meta)
+        self.assertIn("A_DTS,", meta)
+        self.assertNotIn("lang=", meta)
+
+    def test_rejects_missing_audio_track(self) -> None:
+        output = """Track ID: 4
+Stream type: H.264
+Stream ID: V_MPEG4/ISO/AVC
+"""
+        with self.assertRaises(core.ConversionError):
+            parse_tsmuxer_tracks(output)
+
+    def test_rejects_missing_video_track(self) -> None:
+        output = """Track ID: 9
+Stream type: AC3
+Stream ID: A_AC3
+"""
+        with self.assertRaises(core.ConversionError):
+            parse_tsmuxer_tracks(output)
+
+
+class AuthoredIsoAudioTests(unittest.TestCase):
+    def test_detects_ac3_in_handbrake_scan(self) -> None:
+        payload = {
+            "MainFeature": 1,
+            "TitleList": [
+                {
+                    "Index": 1,
+                    "Duration": {"Hours": 1},
+                    "AudioList": [
+                        {
+                            "CodecName": "ac3",
+                            "ChannelCount": 6,
+                            "SampleRate": 48000,
+                        }
+                    ],
+                }
+            ],
+        }
+        codecs = parse_handbrake_audio_codecs(
+            "log line\nJSON Title Set:\n" + json.dumps(payload)
+        )
+        self.assertEqual(codecs, ("ac3",))
+
+    def test_reports_no_audio_in_handbrake_scan(self) -> None:
+        payload = {
+            "MainFeature": 1,
+            "TitleList": [
+                {
+                    "Index": 1,
+                    "Duration": {"Hours": 1},
+                    "AudioList": [],
+                }
+            ],
+        }
+        codecs = parse_handbrake_audio_codecs(
+            "JSON Title Set: " + json.dumps(payload)
+        )
+        self.assertEqual(codecs, ())
 
 
 if __name__ == "__main__":

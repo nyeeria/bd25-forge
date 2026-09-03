@@ -9,7 +9,7 @@ import subprocess
 import sys
 import tempfile
 import threading
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Callable, Iterable
 
@@ -32,6 +32,11 @@ class TitleInfo:
     index: int
     duration_seconds: float
     name: str = ""
+    audio_track_count: int = 1
+    audio_track_indices: tuple[int, ...] = ()
+    audio_bitrate_kbps: int = 0
+    audio_track_descriptions: tuple[str, ...] = ()
+    audio_track_languages: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -72,8 +77,9 @@ class ConversionOptions:
     tsmuxer: Path
     encoder: EncoderChoice
     target_gb: float = 25.0
-    language: str = "eng"
     title: int | None = None
+    audio_track: int | None = None
+    audio_language: str | None = None
     burn_forced_subtitles: bool = False
 
 
@@ -160,7 +166,7 @@ def detect_encoders(handbrake: Path) -> tuple[EncoderChoice, ...]:
     return tuple(sorted(available, key=lambda item: item.handbrake_name != preferred))
 
 
-def parse_handbrake_scan(output: str) -> ScanResult:
+def _parse_handbrake_title_set(output: str) -> dict:
     marker = "JSON Title Set:"
     marker_position = output.find(marker)
     if marker_position < 0:
@@ -175,6 +181,14 @@ def parse_handbrake_scan(output: str) -> ScanResult:
     except json.JSONDecodeError as exc:
         raise ConversionError("Could not parse HandBrake's title scan.") from exc
 
+    if not isinstance(payload, dict):
+        raise ConversionError("HandBrake returned an invalid title scan.")
+    return payload
+
+
+def parse_handbrake_scan(output: str) -> ScanResult:
+    payload = _parse_handbrake_title_set(output)
+
     parsed_titles: list[TitleInfo] = []
     for title in payload.get("TitleList", []):
         duration = title.get("Duration", {})
@@ -185,8 +199,31 @@ def parse_handbrake_scan(output: str) -> ScanResult:
         )
         index = int(title.get("Index", 0))
         if index > 0 and seconds > 0:
+            audio_list = title.get("AudioList", []) or []
+            audio_indices = tuple(
+                int(audio.get("Track", audio.get("TrackNumber", position)))
+                for position, audio in enumerate(audio_list, start=1)
+            )
+            audio_bitrate = sum(
+                int(float(audio.get("Bitrate", 0) or 0))
+                for audio in audio_list
+                if float(audio.get("Bitrate", 0) or 0) > 0
+            )
+            audio_descriptions = tuple(_describe_audio_track(audio, position) for position, audio in enumerate(audio_list, start=1))
+            audio_languages = tuple(
+                str(audio.get("LanguageCode", "") or "").lower() for audio in audio_list
+            )
             parsed_titles.append(
-                TitleInfo(index=index, duration_seconds=seconds, name=str(title.get("Name", "")))
+                TitleInfo(
+                    index=index,
+                    duration_seconds=seconds,
+                    name=str(title.get("Name", "")),
+                    audio_track_count=max(1, len(audio_list)),
+                    audio_track_indices=audio_indices,
+                    audio_bitrate_kbps=audio_bitrate,
+                    audio_track_descriptions=audio_descriptions,
+                    audio_track_languages=audio_languages,
+                )
             )
 
     if not parsed_titles:
@@ -197,6 +234,28 @@ def parse_handbrake_scan(output: str) -> ScanResult:
     if main_feature not in indexes:
         main_feature = max(parsed_titles, key=lambda item: item.duration_seconds).index
     return ScanResult(tuple(parsed_titles), main_feature)
+
+
+def _describe_audio_track(audio: dict, position: int) -> str:
+    track = int(audio.get("Track", audio.get("TrackNumber", position)))
+    language = str(audio.get("Language", "") or audio.get("LanguageCode", "") or "Unknown")
+    codec = str(audio.get("CodecName", "Unknown"))
+    channels = audio.get("ChannelLayout") or audio.get("ChannelCount")
+    channel_text = f", {channels} channels" if channels else ""
+    bitrate = audio.get("Bitrate")
+    bitrate_text = f", {int(float(bitrate))} kb/s" if bitrate else ""
+    return f"Track {track}: {language}, {codec}{channel_text}{bitrate_text}"
+
+
+def parse_handbrake_audio_codecs(output: str) -> tuple[str, ...]:
+    payload = _parse_handbrake_title_set(output)
+    codecs: list[str] = []
+    for title in payload.get("TitleList", []):
+        for audio in title.get("AudioList", []) or []:
+            codec = str(audio.get("CodecName", "")).strip().lower()
+            if codec:
+                codecs.append(codec)
+    return tuple(codecs)
 
 
 def calculate_video_bitrate_kbps(
@@ -222,7 +281,13 @@ def build_handbrake_command(
     intermediate: Path,
     title: TitleInfo,
 ) -> list[str]:
-    bitrate = calculate_video_bitrate_kbps(title.duration_seconds, options.target_gb)
+    audio_tracks = title.audio_track_indices or tuple(range(1, max(1, title.audio_track_count) + 1))
+    audio_bitrate = title.audio_bitrate_kbps or DEFAULT_AUDIO_BITRATE_KBPS * len(audio_tracks)
+    bitrate = calculate_video_bitrate_kbps(
+        title.duration_seconds,
+        options.target_gb,
+        audio_bitrate,
+    )
     command = [
         str(options.handbrake),
         "--json",
@@ -247,15 +312,9 @@ def build_handbrake_command(
         "none",
         "--markers",
         "-a",
-        "1",
+        ",".join(str(track) for track in audio_tracks),
         "-E",
-        "ac3",
-        "-B",
-        str(DEFAULT_AUDIO_BITRATE_KBPS),
-        "-6",
-        "5point1",
-        "--native-language",
-        options.language,
+        "copy",
     ]
     if options.encoder.hardware_decoder:
         command.extend(("--enable-hw-decoding", options.encoder.hardware_decoder))
@@ -268,9 +327,9 @@ def build_handbrake_command(
     return command
 
 
-def parse_tsmuxer_tracks(output: str) -> tuple[int, int]:
+def parse_tsmuxer_track_set(output: str) -> tuple[int, tuple[tuple[int, str], ...]]:
     video_track = 0
-    audio_track = 0
+    audio_tracks: list[tuple[int, str]] = []
     current_track = 0
     for line in output.splitlines():
         track_match = re.search(r"Track ID:\s*(\d+)", line, re.IGNORECASE)
@@ -279,21 +338,54 @@ def parse_tsmuxer_tracks(output: str) -> tuple[int, int]:
             continue
         stream_match = re.search(r"Stream ID:\s*([^\s]+)", line, re.IGNORECASE)
         stream_type = stream_match.group(1).upper() if stream_match else line.upper()
-        if current_track and not video_track and ("V_MPEG4/ISO/AVC" in stream_type or "H.264" in stream_type):
+        if current_track and not video_track and (
+            "V_MPEG4/ISO/AVC" in stream_type or "H.264" in stream_type
+        ):
             video_track = current_track
-        if current_track and not audio_track and ("A_AC3" in stream_type or "AC3" in stream_type):
-            audio_track = current_track
-    return video_track or 1, audio_track or 2
+        if current_track and stream_type.startswith("A_"):
+            track = (current_track, stream_type)
+            if track not in audio_tracks:
+                audio_tracks.append(track)
+
+    if not video_track:
+        raise ConversionError("tsMuxeR did not detect the H.264 video track.")
+    if not audio_tracks:
+        raise ConversionError("tsMuxeR did not detect any audio tracks.")
+    return video_track, tuple(audio_tracks)
 
 
-def build_tsmuxer_meta(media: Path, video_track: int, audio_track: int, language: str) -> str:
+def parse_tsmuxer_tracks(output: str) -> tuple[int, int]:
+    """Return the first audio track for compatibility with existing callers."""
+    video_track, audio_tracks = parse_tsmuxer_track_set(output)
+    return video_track, audio_tracks[0][0]
+
+
+def build_tsmuxer_meta(
+    media: Path,
+    video_track: int,
+    audio_tracks: int | Iterable[int | tuple[int, str]],
+    language: str | None = None,
+) -> str:
     safe_path = str(media.resolve()).replace("\\", "/").replace('"', '\\"')
-    safe_language = language if re.fullmatch(r"[a-zA-Z]{3}", language) else "eng"
+    if isinstance(audio_tracks, int):
+        audio_tracks = (audio_tracks,)
+    audio_lines = tuple(
+        f'{codec}, "{safe_path}", track={track_id}'
+        + (
+            f", lang={language.lower()}"
+            if language and re.fullmatch(r"[a-zA-Z]{3}", language)
+            else ""
+        )
+        for track_id, codec in (
+            track if isinstance(track, tuple) else (track, "A_AC3")
+            for track in audio_tracks
+        )
+    )
     return "\n".join(
         (
             'MUXOPT --blu-ray --vbr --auto-chapters=5 --label="BD25"',
             f'V_MPEG4/ISO/AVC, "{safe_path}", track={video_track}, insertSEI, contSPS',
-            f'A_AC3, "{safe_path}", track={audio_track}, lang={safe_language.lower()}',
+            *audio_lines,
             "",
         )
     )
@@ -343,14 +435,45 @@ class Converter:
         try:
             scan_result = self.scan(options.handbrake, options.source)
             title = self._select_title(scan_result, options.title)
-            bitrate = calculate_video_bitrate_kbps(title.duration_seconds, options.target_gb)
+            if options.audio_track is not None:
+                available_audio = title.audio_track_indices or tuple(
+                    range(1, max(1, title.audio_track_count) + 1)
+                )
+                if options.audio_track not in available_audio:
+                    raise ConversionError(
+                        f"Audio track {options.audio_track} was not found in title {title.index}."
+                    )
+                selected_position = available_audio.index(options.audio_track)
+                selected_language = options.audio_language or (
+                    title.audio_track_languages[selected_position]
+                    if selected_position < len(title.audio_track_languages)
+                    else ""
+                )
+                title = replace(
+                    title,
+                    audio_track_count=1,
+                    audio_track_indices=(options.audio_track,),
+                    audio_bitrate_kbps=(
+                        title.audio_bitrate_kbps // max(1, title.audio_track_count)
+                    ),
+                    audio_track_languages=(selected_language,),
+                )
+            bitrate = calculate_video_bitrate_kbps(
+                title.duration_seconds,
+                options.target_gb,
+                title.audio_bitrate_kbps
+                or DEFAULT_AUDIO_BITRATE_KBPS * max(1, title.audio_track_count),
+            )
             self._log(
                 f"Title {title.index}: {_format_duration(title.duration_seconds)}; "
                 f"target video bitrate {bitrate:,} kb/s"
             )
 
             work_dir = Path(
-                tempfile.mkdtemp(prefix=f".{options.destination.stem}-work-", dir=options.destination.parent)
+                tempfile.mkdtemp(
+                    prefix=f".{options.destination.stem}-work-",
+                    dir=options.destination.parent,
+                )
             )
             intermediate = work_dir / "encoded.mkv"
             command = build_handbrake_command(options, intermediate, title)
@@ -360,7 +483,13 @@ class Converter:
             if not intermediate.is_file() or intermediate.stat().st_size == 0:
                 raise ConversionError("HandBrake finished without creating the encoded movie.")
             expected_bytes = (
-                (bitrate + DEFAULT_AUDIO_BITRATE_KBPS)
+                (
+                    bitrate
+                    + (
+                        title.audio_bitrate_kbps
+                        or DEFAULT_AUDIO_BITRATE_KBPS * max(1, title.audio_track_count)
+                    )
+                )
                 * title.duration_seconds
                 * 1000
                 / 8
@@ -372,10 +501,17 @@ class Converter:
                 )
 
             track_output = self._run_capture([str(options.tsmuxer), str(intermediate)], echo=True)
-            video_track, audio_track = parse_tsmuxer_tracks(track_output)
+            video_track, audio_tracks = parse_tsmuxer_track_set(track_output)
             meta = work_dir / "disc.meta"
             meta.write_text(
-                build_tsmuxer_meta(intermediate, video_track, audio_track, options.language),
+                build_tsmuxer_meta(
+                    intermediate,
+                    video_track,
+                    audio_tracks,
+                    title.audio_track_languages[0]
+                    if title.audio_track_languages
+                    else None,
+                ),
                 encoding="utf-8",
             )
 
@@ -396,6 +532,28 @@ class Converter:
                 raise ConversionError(
                     "The authored ISO exceeded the requested size. The partial ISO was removed."
                 )
+
+            self._progress("Verifying", 0.99, "Checking authored Blu-ray audio")
+            verify_output = self._run_capture(
+                [
+                    str(options.handbrake),
+                    "--json",
+                    "-i",
+                    str(options.destination),
+                    "-t",
+                    "0",
+                    "--scan",
+                ],
+                echo=False,
+            )
+            audio_codecs = parse_handbrake_audio_codecs(verify_output)
+            if len(audio_codecs) < max(1, title.audio_track_count):
+                detected = ", ".join(audio_codecs) if audio_codecs else "none"
+                raise ConversionError(
+                    "The authored Blu-ray ISO does not expose all copied audio tracks "
+                    f"(detected: {detected}). The ISO was removed."
+                )
+            self._log(f"Verified authored ISO audio: {', '.join(audio_codecs)}")
 
             succeeded = True
             size_gb = options.destination.stat().st_size / DECIMAL_GB
@@ -435,8 +593,6 @@ class Converter:
             raise ConversionError("The integrated HandBrake runtime is missing or damaged.")
         if not options.tsmuxer.is_file():
             raise ConversionError("The integrated Blu-ray authoring runtime is missing or damaged.")
-        if not re.fullmatch(r"[a-zA-Z]{3}", options.language):
-            raise ConversionError("Audio language must be a three-letter ISO 639-2 code.")
         try:
             calculate_video_bitrate_kbps(1, options.target_gb)
         except ValueError as exc:
@@ -512,7 +668,11 @@ class Converter:
         match = re.search(r"([0-9]+(?:\.[0-9]+)?)%", line)
         if match:
             percent = min(float(match.group(1)), 100)
-            self._progress("Authoring", 0.90 + percent / 100 * 0.09, f"Authoring {percent:.1f}%")
+            self._progress(
+                "Authoring",
+                0.90 + percent / 100 * 0.09,
+                f"Authoring {percent:.1f}%",
+            )
 
     def _check_cancelled(self) -> None:
         if self._cancel.is_set():
